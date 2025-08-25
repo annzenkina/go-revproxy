@@ -1,0 +1,37 @@
+# Binaries
+/bin/
+/*.exe
+/*.exe~
+/*.dll
+/*.so
+/*.dylib
+
+# Go build cache / test binaries
+*.test
+*.out
+
+# IDE/editor clutter
+.vscode/
+.idea/
+*.swp
+*~
+
+# Logs
+*.log
+
+# Dependency directories (if vendoring)
+vendor/
+
+
+# Containers
+*.pid
+*.seed
+
+# Podman/Docker
+/.podman/
+/.docker/
+/docker-compose.override.yml
+
+# OS cruft
+.DS_Store
+Thumbs.db
