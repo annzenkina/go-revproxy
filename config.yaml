@@ -1,0 +1,8 @@
+listen: ":8080"
+routes:
+  - prefix: "/server1"
+    target: "http://localhost:9001"
+  - prefix: "/server2"
+    target: "http://localhost:9002"
+  - prefix: "/server3"
+    target: "http://localhost:9003"

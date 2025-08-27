@@ -5,6 +5,7 @@ COMPOSE_FILE := docker-compose.yaml
 .PHONY: up down logs ps build run tidy clean
 
 up:
+	podman machine start
 	podman compose -f $(COMPOSE_FILE) up -d
 
 down:
@@ -17,10 +18,9 @@ ps:
 	podman ps --format "table {{.Names}}\t{{.Image}}\t{{.Ports}}"
 
 build:
-	go build -o bin/$(APP) ./cmd/proxy
-
+	go build -o bin/$(APP) ./main.go
 run:
-	go run ./cmd/proxy --config config.yaml
+	go run ./main.go --config config.yaml
 
 tidy:
 	go mod tidy
