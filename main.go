@@ -5,7 +5,18 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+
+	"gopkg.in/yaml.v3"
 )
+
+type Config struct {
+	Listen string `yaml:"listen"`
+	Routes []struct {
+		Prefix string `yaml:"prefix"`
+		Target string `yaml:"target"`
+	} `yaml:"routes"`
+}
 
 func getNextServer(counter int16, urls []*url.URL) *url.URL {
 	index := int(counter) % len(urls)
@@ -22,35 +33,55 @@ func getNextServer(counter int16, urls []*url.URL) *url.URL {
 	}
 }
 
-func main() {
-	counter := int16(0)
-	listenAddr := ":8080"
-	targets := []string{
-		"http://localhost:9001",
-		"http://localhost:9002",
-		"http://localhost:9003",
+// loadConfig reads and parses the YAML configuration file
+func loadConfig(filename string) (*Config, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, err
 	}
 
-	// Parse all target URLs
-	targetURLs := make([]*url.URL, len(targets))
-	for i, targetStr := range targets {
-		targetURL, err := url.Parse(targetStr)
+	var config Config
+	err = yaml.Unmarshal(data, &config)
+	if err != nil {
+		return nil, err
+	}
+
+	return &config, nil
+}
+
+func main() {
+	// Load configuration from YAML file
+	config, err := loadConfig("config.yaml")
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	counter := int16(0)
+	listenAddr := config.Listen
+
+	// Parse all target URLs from config
+	targetURLs := make([]*url.URL, len(config.Routes))
+	for i, route := range config.Routes {
+		targetURL, err := url.Parse(route.Target)
 		if err != nil {
-			log.Fatalf("bad target %s: %v", targetStr, err)
+			log.Fatalf("bad target %s: %v", route.Target, err)
 		}
 		targetURLs[i] = targetURL
 	}
 
-	// Create a handler that increments counter for each request
-	http.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
-		counter++
-		nextURL := getNextServer(counter, targetURLs)
-		proxy := httputil.NewSingleHostReverseProxy(nextURL)
-		log.Printf("Request %d: forwarding to %s", counter, nextURL.String())
-		proxy.ServeHTTP(w, r)
-	})
+	// Create handlers for each route
+	for _, route := range config.Routes {
+		prefix := route.Prefix
+		http.HandleFunc(prefix+"/", func(w http.ResponseWriter, r *http.Request) {
+			counter++
+			nextURL := getNextServer(counter, targetURLs)
+			proxy := httputil.NewSingleHostReverseProxy(nextURL)
+			log.Printf("Request %d: forwarding to %s", counter, nextURL.String())
+			proxy.ServeHTTP(w, r)
+		})
+	}
 
-	log.Printf("listening on :8080, forwarding -> :900X")
+	log.Printf("listening on %s, forwarding based on config", listenAddr)
 	if err := http.ListenAndServe(listenAddr, nil); err != nil {
 		log.Fatal(err)
 	}
