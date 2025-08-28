@@ -4,13 +4,31 @@ services:
     image: nginxdemos/hello:plain-text
     container_name: demo-server1
     ports: ["9001:80"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
   server2:
     image: nginxdemos/hello:plain-text
     container_name: demo-server2
     ports: ["9002:80"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
   server3:
     image: nginxdemos/hello:plain-text
     container_name: demo-server3
     ports: ["9003:80"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
