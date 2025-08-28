@@ -5,7 +5,7 @@ COMPOSE_FILE := docker-compose.yaml
 .PHONY: up down logs ps build run tidy clean
 
 up:
-	podman machine start
+	podman machine start || true
 	podman compose -f $(COMPOSE_FILE) up -d
 
 down:
@@ -28,7 +28,7 @@ tidy:
 clean:
 	rm -rf bin
 
-call-server1:
+:
 	curl -s localhost:9001 | head -n1
 
 call-server2:

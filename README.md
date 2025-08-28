@@ -115,6 +115,15 @@ To modify the application:
 - `make tidy` - Clean up Go module dependencies
 - `make clean` - Remove build artifacts
 
+### What I'm going to develop next
+– healthchecks, skip unhealthy servers
+– health status endpoing
+– configuration management
+– rate limiting
+– modifying headers (adding custom respone header, add / remove headers)
+– metrics & logging (not sure what I'll do here yet)
+
+
 ## License
 
 This project is open source.
