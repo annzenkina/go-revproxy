@@ -28,7 +28,7 @@ tidy:
 clean:
 	rm -rf bin
 
-:
+call-server1:
 	curl -s localhost:9001 | head -n1
 
 call-server2:

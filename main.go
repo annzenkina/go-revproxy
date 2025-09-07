@@ -8,6 +8,8 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -25,6 +27,77 @@ type ServerStatus struct {
 	URL     string `json:"url"`
 	Healthy bool   `json:"healthy"`
 	Error   string `json:"error,omitempty"`
+}
+
+type LoadBalancer struct {
+	servers    []*url.URL
+	statuses   []ServerStatus
+	counter    int32
+	mu         sync.RWMutex
+	healthChan chan struct{}
+}
+
+func (lb *LoadBalancer) StartHealthChecks(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	go func() {
+		for range ticker.C {
+			lb.performHealthChecks()
+		}
+	}()
+}
+
+func (lb *LoadBalancer) performHealthChecks() {
+	var wg sync.WaitGroup
+
+	for i := range lb.servers {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			status := checkServerHealth(lb.servers[index].String())
+			lb.mu.Lock()
+			lb.statuses[index] = status
+			lb.mu.Unlock()
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Signal that health checks are complete
+	select {
+	case lb.healthChan <- struct{}{}:
+	default:
+	}
+}
+
+func (lb *LoadBalancer) GetNextHealthyServer() *url.URL {
+	lb.mu.RLock()
+	defer lb.mu.RUnlock()
+
+	// Get healthy servers
+	var healthyServers []*url.URL
+	for i, status := range lb.statuses {
+		if status.Healthy {
+			healthyServers = append(healthyServers, lb.servers[i])
+		}
+	}
+
+	if len(healthyServers) == 0 {
+		return nil // No healthy servers available
+	}
+
+	// Round-robin among healthy servers
+	counter := atomic.AddInt32(&lb.counter, 1)
+	index := int(counter) % len(healthyServers)
+	return healthyServers[index]
+}
+
+func (lb *LoadBalancer) GetServerStatuses() []ServerStatus {
+	lb.mu.RLock()
+	defer lb.mu.RUnlock()
+
+	statuses := make([]ServerStatus, len(lb.statuses))
+	copy(statuses, lb.statuses)
+	return statuses
 }
 
 func checkServerHealth(serverURL string) ServerStatus {
@@ -70,21 +143,6 @@ func checkServerHealth(serverURL string) ServerStatus {
 	return serverResponse
 }
 
-func getNextServer(counter int16, urls []*url.URL) *url.URL {
-	index := int(counter) % len(urls)
-
-	switch index {
-	case 0:
-		return urls[0] // Return first URL
-	case 1:
-		return urls[1] // Return second URL
-	case 2:
-		return urls[2] // Return third URL
-	default:
-		return urls[0] // Default to first URL
-	}
-}
-
 // loadConfig reads and parses the YAML configuration file
 func loadConfig(filename string) (*Config, error) {
 	data, err := os.ReadFile(filename)
@@ -108,7 +166,6 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	counter := int16(0)
 	listenAddr := config.Listen
 
 	// Parse all target URLs from config
@@ -121,17 +178,28 @@ func main() {
 		targetURLs[i] = targetURL
 	}
 
+	// Create load balancer
+	loadBalancer := &LoadBalancer{
+		servers:    targetURLs,
+		statuses:   make([]ServerStatus, len(targetURLs)),
+		healthChan: make(chan struct{}, 1),
+	}
+
+	// Initialize statuses
+	for i, server := range targetURLs {
+		loadBalancer.statuses[i] = ServerStatus{
+			URL:     server.String(),
+			Healthy: true, // Assume healthy initially
+		}
+	}
+
+	// Start periodic health checks (every 30 seconds)
+	loadBalancer.StartHealthChecks(30 * time.Second)
+
 	// Add health check endpoint
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-
-		var serverStatuses []ServerStatus
-		for _, route := range config.Routes {
-			status := checkServerHealth(route.Target)
-			serverStatuses = append(serverStatuses, status)
-		}
-
-		// Return the server statuses directly
+		serverStatuses := loadBalancer.GetServerStatuses()
 		json.NewEncoder(w).Encode(serverStatuses)
 	})
 
@@ -139,16 +207,23 @@ func main() {
 	for _, route := range config.Routes {
 		prefix := route.Prefix
 		http.HandleFunc(prefix+"/", func(w http.ResponseWriter, r *http.Request) {
-			counter++
-			nextURL := getNextServer(counter, targetURLs)
+			nextURL := loadBalancer.GetNextHealthyServer()
+
+			if nextURL == nil {
+				log.Printf("No healthy servers available for request to %s", r.URL.Path)
+				http.Error(w, "Service Unavailable - No healthy servers", http.StatusServiceUnavailable)
+				return
+			}
+
 			proxy := httputil.NewSingleHostReverseProxy(nextURL)
-			log.Printf("Request %d: forwarding to %s", counter, nextURL.String())
+			log.Printf("Request: forwarding %s to %s", r.URL.Path, nextURL.String())
 			proxy.ServeHTTP(w, r)
 		})
 	}
 
 	log.Printf("listening on %s, forwarding based on config", listenAddr)
 	log.Printf("Health checks available at /healthz")
+	log.Printf("Starting health checks every 30 seconds")
 	if err := http.ListenAndServe(listenAddr, nil); err != nil {
 		log.Fatal(err)
 	}
