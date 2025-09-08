@@ -101,12 +101,7 @@ func (lb *LoadBalancer) GetServerStatuses() []ServerStatus {
 }
 
 func checkServerHealth(serverURL string) ServerStatus {
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-	}
-
-	healthURL := serverURL + "/healthz"
-	resp, err := client.Get(healthURL)
+	resp, err := http.Get(serverURL + "/")
 
 	if err != nil {
 		return ServerStatus{
@@ -203,23 +198,20 @@ func main() {
 		json.NewEncoder(w).Encode(serverStatuses)
 	})
 
-	// Create handlers for each route
-	for _, route := range config.Routes {
-		prefix := route.Prefix
-		http.HandleFunc(prefix+"/", func(w http.ResponseWriter, r *http.Request) {
-			nextURL := loadBalancer.GetNextHealthyServer()
+	// Add load-balanced /hello endpoint
+	http.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
+		nextURL := loadBalancer.GetNextHealthyServer()
 
-			if nextURL == nil {
-				log.Printf("No healthy servers available for request to %s", r.URL.Path)
-				http.Error(w, "Service Unavailable - No healthy servers", http.StatusServiceUnavailable)
-				return
-			}
+		if nextURL == nil {
+			log.Printf("No healthy servers available for request to %s", r.URL.Path)
+			http.Error(w, "Service Unavailable - No healthy servers", http.StatusServiceUnavailable)
+			return
+		}
 
-			proxy := httputil.NewSingleHostReverseProxy(nextURL)
-			log.Printf("Request: forwarding %s to %s", r.URL.Path, nextURL.String())
-			proxy.ServeHTTP(w, r)
-		})
-	}
+		proxy := httputil.NewSingleHostReverseProxy(nextURL)
+		log.Printf("Request: forwarding %s to %s", r.URL.Path, nextURL.String())
+		proxy.ServeHTTP(w, r)
+	})
 
 	log.Printf("listening on %s, forwarding based on config", listenAddr)
 	log.Printf("Health checks available at /healthz")
