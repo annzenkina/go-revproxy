@@ -1,13 +1,19 @@
 # Go Reverse Proxy Load Balancer
 
-A simple round-robin load balancer written in Go that distributes incoming HTTP requests across multiple backend servers.
+A health-aware round-robin load balancer written in Go that intelligently distributes incoming HTTP requests across healthy backend servers with automatic health monitoring and graceful failure handling.
 
 ## Features
 
-- **Round-robin load balancing**: Distributes requests evenly across backend servers
-- **Dynamic routing**: Each request is routed to the next server in sequence
-- **Request logging**: Logs each request with counter and destination server
-- **Simple configuration**: Easy to modify backend server URLs
+- **Health-aware load balancing**: Automatically skips unhealthy servers and distributes requests only to healthy ones
+- **Round-robin distribution**: Evenly distributes requests across available healthy servers
+- **Automatic health checks**: Continuously monitors backend server health every 5 seconds
+- **Request-level retry logic**: Automatically retries failed requests on different healthy servers (up to 3 attempts)
+- **Real-time failure detection**: Immediately re-checks server health when requests fail, doesn't wait for next health check cycle
+- **YAML configuration**: Flexible configuration management via `config.yaml`
+- **Health monitoring endpoint**: Real-time health status via `/healthz` API endpoint
+- **Graceful failure handling**: Returns appropriate HTTP errors when all servers are down or all retries fail
+- **Request logging**: Comprehensive logging of requests, health checks, retries, and server status changes
+- **Concurrent health checking**: Non-blocking parallel health checks for optimal performance
 
 ## Usage
 
@@ -49,7 +55,11 @@ This command will start the backend servers using Podman containers, then run th
 
 3. **Access the application:**
    ```bash
+   # Test load balancing
    curl http://localhost:8080/hello
+   
+   # Check server health status  
+   curl http://localhost:8080/healthz
    ```
 
 ### Testing Backend Servers
@@ -64,42 +74,75 @@ make call-server3  # Test server on localhost:9003
 
 ### Configuration
 
-The backend servers are configured in the `main.go` file:
+The application uses YAML configuration via `config.yaml`. Copy `config.example.yaml` to get started:
 
-```go
-targets := []string{
-    "http://localhost:9001",
-    "http://localhost:9002", 
-    "http://localhost:9003",
-}
+```bash
+cp config.example.yaml config.yaml
 ```
 
+Example configuration:
+```yaml
+listen: ":8080"
+routes:
+  - prefix: "/server1"
+    target: "http://localhost:9001"
+  - prefix: "/server2" 
+    target: "http://localhost:9002"
+  - prefix: "/server3"
+    target: "http://localhost:9003"
+```
 
 ## How It Works
 
-1. **Request Handling**: Each incoming request to `/hello` triggers the load balancer
-2. **Counter Increment**: A request counter is incremented for each request
-3. **Server Selection**: The counter is used with modulo operation to select the next backend server
-4. **Request Forwarding**: The request is proxied to the selected backend server
-5. **Logging**: Request details are logged including the counter and destination server
+1. **Health Monitoring**: Every 5 seconds, the load balancer checks all backend servers concurrently
+2. **Request Handling**: Incoming requests to `/hello` trigger the health-aware load balancer
+3. **Healthy Server Selection**: Only healthy servers are considered for load balancing
+4. **Round-robin Distribution**: Requests are distributed evenly among healthy servers using an atomic counter
+5. **Request Forwarding**: The request is proxied to the selected healthy backend server
+6. **Real-time Retry Logic**: If a request fails (server went down between health checks):
+   - Immediately triggers a health check for the failed server
+   - Automatically retries the request on the next healthy server (up to 3 attempts total)
+   - Updates server status in real-time without waiting for the next health check cycle
+7. **Failure Handling**: If all servers are unhealthy or all retries fail, returns HTTP 502 Bad Gateway
+8. **Logging**: Comprehensive logging of health checks, server status changes, request routing, and retry attempts
 
 ## Load Balancing Pattern
 
-The load balancer uses a simple round-robin algorithm:
-- Request 1 → Server 1 (localhost:9001)
-- Request 2 → Server 2 (localhost:9002) 
-- Request 3 → Server 3 (localhost:9003)
-- Request 4 → Server 1 (localhost:9001)
-- And so on...
+The load balancer uses a health-aware round-robin algorithm:
+- **Only healthy servers receive traffic**
+- If all servers are healthy: Request 1 → Server 1, Request 2 → Server 2, etc.
+- If Server 2 is unhealthy: Request 1 → Server 1, Request 2 → Server 3, Request 3 → Server 1, etc.
+- **Automatic recovery**: When unhealthy servers recover, they're automatically included in rotation
+
+## API Endpoints
+
+- **`/hello`** - Load-balanced endpoint that forwards requests to healthy backend servers
+- **`/healthz`** - Health monitoring endpoint that returns JSON status of all backend servers
+
+Example health check response:
+```json
+[
+  {"url": "http://localhost:9001", "healthy": true},
+  {"url": "http://localhost:9002", "healthy": false, "error": "connection refused"},
+  {"url": "http://localhost:9003", "healthy": true}
+]
+```
 
 ## Example Output
 
 ```
-2024/01/01 12:00:00 listening on :8080, forwarding -> :900X
-2024/01/01 12:00:05 Request 1: forwarding to http://localhost:9001
-2024/01/01 12:00:06 Request 2: forwarding to http://localhost:9002
-2024/01/01 12:00:07 Request 3: forwarding to http://localhost:9003
-2024/01/01 12:00:08 Request 4: forwarding to http://localhost:9001
+2024/01/01 12:00:00 listening on :8080, forwarding based on config
+2024/01/01 12:00:00 Health checks available at /healthz
+2024/01/01 12:00:00 Starting health checks every 5s
+2024/01/01 12:00:00 Running initial health check...
+2024/01/01 12:00:05 Request: forwarding /hello to http://localhost:9001 (attempt 1)
+2024/01/01 12:00:06 Request: forwarding /hello to http://localhost:9002 (attempt 1)
+2024/01/01 12:00:07 Info: Server http://localhost:9003 responded with HTTP 200 (non-JSON), treating as healthy
+2024/01/01 12:00:08 Request: forwarding /hello to http://localhost:9003 (attempt 1)
+2024/01/01 12:00:10 Request failed to http://localhost:9001: dial tcp 127.0.0.1:9001: connection refused (attempt 1/3)
+2024/01/01 12:00:10 Request: forwarding /hello to http://localhost:9002 (attempt 2)
+2024/01/01 12:00:15 CRITICAL: All servers are down! Load balancer entering failure mode.
+2024/01/01 12:00:20 RECOVERY: Servers are back online! Load balancer operational again.
 ```
 
 ## Development
@@ -115,13 +158,19 @@ To modify the application:
 - `make tidy` - Clean up Go module dependencies
 - `make clean` - Remove build artifacts
 
-### What I'm going to develop next
-– healthchecks, skip unhealthy servers
-– health status endpoing
-– configuration management
-– rate limiting
-– modifying headers (adding custom respone header, add / remove headers)
-– metrics & logging (not sure what I'll do here yet)
+### Completed Features ✅
+- ✅ **Health checks** - Automatic monitoring and skipping of unhealthy servers
+- ✅ **Health status endpoint** - `/healthz` API for monitoring server status
+- ✅ **Configuration management** - YAML-based configuration system
+- ✅ **Enhanced logging** - Comprehensive request and health check logging
+
+### Planned Features 🚧
+- Add retry logic to handle server failures during request forwarding
+- **Rate limiting** - Request throttling and protection
+- **Header modification** - Adding custom response headers, removing/modifying request headers  
+- **Advanced metrics** - Prometheus metrics, request timing, throughput statistics
+- **Multiple routing strategies** - Weighted round-robin, least connections, IP hash
+- **SSL/TLS termination** - HTTPS support with certificate management
 
 
 ## License

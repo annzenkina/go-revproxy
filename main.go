@@ -130,6 +130,31 @@ func (lb *LoadBalancer) IsOperational() bool {
 	return lb.operational
 }
 
+// TriggerImmediateHealthCheck performs an immediate health check on a specific server
+func (lb *LoadBalancer) TriggerImmediateHealthCheck(serverURL string) {
+	go func() {
+		status := checkServerHealthWithRetry(serverURL)
+		lb.mu.Lock()
+		// Find and update the status of this specific server
+		for i, server := range lb.servers {
+			if server.String() == serverURL {
+				oldStatus := lb.statuses[i].Healthy
+				lb.statuses[i] = status
+				if oldStatus != status.Healthy {
+					if status.Healthy {
+						log.Printf("Server %s recovered and is now healthy", serverURL)
+					} else {
+						log.Printf("Server %s marked as unhealthy: %s", serverURL, status.Error)
+					}
+				}
+				break
+			}
+		}
+		lb.mu.Unlock()
+		lb.updateOperationalStatus()
+	}()
+}
+
 func checkServerHealth(serverURL string) ServerStatus {
 	resp, err := http.Get(serverURL + "/")
 
@@ -166,6 +191,35 @@ func checkServerHealth(serverURL string) ServerStatus {
 	// Use the parsed response, but ensure the URL is set correctly
 	serverResponse.URL = serverURL
 	return serverResponse
+}
+
+// checkServerHealthWithRetry performs health check with retry logic
+func checkServerHealthWithRetry(serverURL string) ServerStatus {
+	maxRetries := 3
+	var lastStatus ServerStatus
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		log.Printf("Health check attempt %d/%d for %s", attempt, maxRetries, serverURL)
+		status := checkServerHealth(serverURL)
+
+		if status.Healthy {
+			if attempt > 1 {
+				log.Printf("Server %s recovered after %d attempts", serverURL, attempt)
+			}
+			return status
+		}
+
+		lastStatus = status
+		log.Printf("Health check failed for %s (attempt %d/%d): %s", serverURL, attempt, maxRetries, status.Error)
+
+		// Don't wait after the last attempt
+		if attempt < maxRetries {
+			time.Sleep(time.Duration(attempt) * time.Second) // Progressive backoff: 1s, 2s, 3s
+		}
+	}
+
+	log.Printf("Server %s failed all %d health check attempts, marking as unhealthy", serverURL, maxRetries)
+	return lastStatus
 }
 
 // loadConfig reads and parses the YAML configuration file
@@ -241,17 +295,55 @@ func main() {
 			return
 		}
 
-		nextURL := loadBalancer.GetNextHealthyServer()
+		// Simple retry logic: try up to 3 different healthy servers
+		maxRetries := 3
 
-		if nextURL == nil {
-			log.Printf("No healthy servers available for request to %s", r.URL.Path)
-			http.Error(w, "Bad Gateway - No healthy backend servers", http.StatusBadGateway)
-			return
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			nextURL := loadBalancer.GetNextHealthyServer()
+			if nextURL == nil {
+				log.Printf("No healthy servers available for request to %s", r.URL.Path)
+				http.Error(w, "Bad Gateway - No healthy backend servers", http.StatusBadGateway)
+				return
+			}
+
+			// Create a simple reverse proxy
+			proxy := httputil.NewSingleHostReverseProxy(nextURL)
+			requestFailed := false
+
+			// Custom error handler to catch connection failures
+			proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+				log.Printf("Request failed to %s: %v", nextURL.String(), err)
+				requestFailed = true
+
+				// Trigger immediate health check for the failed server
+				log.Printf("Triggering immediate health check for failed server: %s", nextURL.String())
+				loadBalancer.TriggerImmediateHealthCheck(nextURL.String())
+
+				// Only send error response on the last attempt
+				if attempt == maxRetries-1 {
+					log.Printf("All retry attempts exhausted for %s", r.URL.Path)
+					http.Error(rw, "Bad Gateway - All backend servers failed", http.StatusBadGateway)
+				}
+			}
+
+			log.Printf("Request: forwarding %s to %s", r.URL.Path, nextURL.String())
+
+			// Try to serve the request
+			proxy.ServeHTTP(w, r)
+
+			// If request succeeded, we're done
+			if !requestFailed {
+				return
+			}
+
+			// If this was the last attempt, error response already sent
+			if attempt == maxRetries-1 {
+				return
+			}
+
+			// Brief pause before retrying to allow immediate health check to complete
+			time.Sleep(100 * time.Millisecond)
 		}
-
-		proxy := httputil.NewSingleHostReverseProxy(nextURL)
-		log.Printf("Request: forwarding %s to %s", r.URL.Path, nextURL.String())
-		proxy.ServeHTTP(w, r)
 	})
 
 	log.Printf("listening on %s, forwarding based on config", listenAddr)
