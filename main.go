@@ -15,6 +15,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	HealthCheckInterval = 5 * time.Second
+)
+
 type Config struct {
 	Listen string `yaml:"listen"`
 	Routes []struct {
@@ -214,8 +218,12 @@ func main() {
 		}
 	}
 
-	// Start periodic health checks (every 30 seconds)
-	loadBalancer.StartHealthChecks(30 * time.Second)
+	// Run initial health check immediately
+	log.Printf("Running initial health check...")
+	loadBalancer.performHealthChecks()
+
+	// Start periodic health checks
+	loadBalancer.StartHealthChecks(HealthCheckInterval)
 
 	// Add health check endpoint
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -229,7 +237,7 @@ func main() {
 		// Check if load balancer is operational
 		if !loadBalancer.IsOperational() {
 			log.Printf("Load balancer not operational - all servers down for request to %s", r.URL.Path)
-			http.Error(w, "Service Unavailable - Load balancer not operational", http.StatusServiceUnavailable)
+			http.Error(w, "Bad Gateway - All backend servers are down", http.StatusBadGateway)
 			return
 		}
 
@@ -237,7 +245,7 @@ func main() {
 
 		if nextURL == nil {
 			log.Printf("No healthy servers available for request to %s", r.URL.Path)
-			http.Error(w, "Service Unavailable - No healthy servers", http.StatusServiceUnavailable)
+			http.Error(w, "Bad Gateway - No healthy backend servers", http.StatusBadGateway)
 			return
 		}
 
@@ -248,7 +256,7 @@ func main() {
 
 	log.Printf("listening on %s, forwarding based on config", listenAddr)
 	log.Printf("Health checks available at /healthz")
-	log.Printf("Starting health checks every 30 seconds")
+	log.Printf("Starting health checks every %v", HealthCheckInterval)
 	if err := http.ListenAndServe(listenAddr, nil); err != nil {
 		log.Fatal(err)
 	}
