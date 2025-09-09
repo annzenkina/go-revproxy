@@ -30,11 +30,12 @@ type ServerStatus struct {
 }
 
 type LoadBalancer struct {
-	servers    []*url.URL
-	statuses   []ServerStatus
-	counter    int32
-	mu         sync.RWMutex
-	healthChan chan struct{}
+	servers       []*url.URL
+	statuses      []ServerStatus
+	counter       int32
+	mu            sync.RWMutex
+	operational   bool
+	operationalMu sync.RWMutex
 }
 
 func (lb *LoadBalancer) StartHealthChecks(interval time.Duration) {
@@ -48,24 +49,43 @@ func (lb *LoadBalancer) StartHealthChecks(interval time.Duration) {
 
 func (lb *LoadBalancer) performHealthChecks() {
 	var wg sync.WaitGroup
+	wg.Add(len(lb.servers))
 
-	for i := range lb.servers {
-		wg.Add(1)
-		go func(index int) {
+	for i, server := range lb.servers {
+		go func(index int, serverURL *url.URL) {
 			defer wg.Done()
-			status := checkServerHealth(lb.servers[index].String())
+			status := checkServerHealth(serverURL.String())
 			lb.mu.Lock()
 			lb.statuses[index] = status
 			lb.mu.Unlock()
-		}(i)
+		}(i, server)
 	}
 
 	wg.Wait()
 
-	// Signal that health checks are complete
-	select {
-	case lb.healthChan <- struct{}{}:
-	default:
+	// Update operational status directly after health checks complete
+	lb.updateOperationalStatus()
+}
+
+func (lb *LoadBalancer) updateOperationalStatus() {
+	lb.mu.RLock()
+	healthyCount := 0
+	for _, status := range lb.statuses {
+		if status.Healthy {
+			healthyCount++
+		}
+	}
+	lb.mu.RUnlock()
+
+	lb.operationalMu.Lock()
+	wasOperational := lb.operational
+	lb.operational = healthyCount > 0
+	lb.operationalMu.Unlock()
+
+	if !lb.operational && wasOperational {
+		log.Printf("CRITICAL: All servers are down! Load balancer entering failure mode.")
+	} else if lb.operational && !wasOperational {
+		log.Printf("RECOVERY: Servers are back online! Load balancer operational again.")
 	}
 }
 
@@ -98,6 +118,12 @@ func (lb *LoadBalancer) GetServerStatuses() []ServerStatus {
 	statuses := make([]ServerStatus, len(lb.statuses))
 	copy(statuses, lb.statuses)
 	return statuses
+}
+
+func (lb *LoadBalancer) IsOperational() bool {
+	lb.operationalMu.RLock()
+	defer lb.operationalMu.RUnlock()
+	return lb.operational
 }
 
 func checkServerHealth(serverURL string) ServerStatus {
@@ -175,9 +201,9 @@ func main() {
 
 	// Create load balancer
 	loadBalancer := &LoadBalancer{
-		servers:    targetURLs,
-		statuses:   make([]ServerStatus, len(targetURLs)),
-		healthChan: make(chan struct{}, 1),
+		servers:     targetURLs,
+		statuses:    make([]ServerStatus, len(targetURLs)),
+		operational: true, // Assume operational initially
 	}
 
 	// Initialize statuses
@@ -200,6 +226,13 @@ func main() {
 
 	// Add load-balanced /hello endpoint
 	http.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
+		// Check if load balancer is operational
+		if !loadBalancer.IsOperational() {
+			log.Printf("Load balancer not operational - all servers down for request to %s", r.URL.Path)
+			http.Error(w, "Service Unavailable - Load balancer not operational", http.StatusServiceUnavailable)
+			return
+		}
+
 		nextURL := loadBalancer.GetNextHealthyServer()
 
 		if nextURL == nil {
