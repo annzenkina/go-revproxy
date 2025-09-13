@@ -6,3 +6,7 @@ routes:
     target: "http://localhost:9002"
   - prefix: "/server3"
     target: "http://localhost:9003"
+
+rateLimitTokenCapacity: 5           # max tokens per client bucket
+rateLimitResetInterval: 1m          # interval to reset to full capacity
+healthCheckInterval: 5s             # interval between health checks

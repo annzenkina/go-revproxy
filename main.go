@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,7 +18,9 @@ import (
 )
 
 const (
-	HealthCheckInterval = 5 * time.Second
+	HealthCheckInterval        = 5 * time.Second
+	DefaultTokenBucketCapacity = 5
+	DefaultTokenResetInterval  = 1 * time.Minute
 )
 
 type Config struct {
@@ -25,12 +29,145 @@ type Config struct {
 		Prefix string `yaml:"prefix"`
 		Target string `yaml:"target"`
 	} `yaml:"routes"`
+	RateLimitTokenCapacity int           `yaml:"rateLimitTokenCapacity"`
+	RateLimitResetInterval time.Duration `yaml:"rateLimitResetInterval"`
+	HealthCheckInterval    time.Duration `yaml:"healthCheckInterval"`
 }
 
 type ServerStatus struct {
 	URL     string `json:"url"`
 	Healthy bool   `json:"healthy"`
 	Error   string `json:"error,omitempty"`
+}
+
+// TokenBucket represents a token bucket for rate limiting
+type TokenBucket struct {
+	capacity      int           // Maximum number of tokens in bucket
+	tokens        int           // Current number of tokens
+	lastReset     time.Time     // Last time tokens were reset to full capacity
+	resetInterval time.Duration // Interval at which tokens reset to full capacity
+	mu            sync.Mutex    // Mutex for thread safety
+}
+
+// NewTokenBucket creates a new token bucket
+func NewTokenBucket(capacity int, resetInterval time.Duration) *TokenBucket {
+	return &TokenBucket{
+		capacity:      capacity,
+		tokens:        capacity, // Start with full capacity
+		lastReset:     time.Now(),
+		resetInterval: resetInterval,
+	}
+}
+
+// Allow checks if a request should be allowed (consumes a token)
+func (tb *TokenBucket) Allow() bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+
+	now := time.Now()
+
+	// Check if it's time to reset tokens to full capacity
+	if now.Sub(tb.lastReset) >= tb.resetInterval {
+		tb.tokens = tb.capacity
+		tb.lastReset = now
+	}
+
+	// Check if we have tokens available
+	if tb.tokens > 0 {
+		tb.tokens--
+		return true
+	}
+
+	return false
+}
+
+// RateLimiter manages rate limiting for multiple clients
+type RateLimiter struct {
+	buckets       map[string]*TokenBucket
+	mu            sync.RWMutex
+	cleanup       chan struct{}
+	capacity      int
+	resetInterval time.Duration
+}
+
+// NewRateLimiter creates a new rate limiter
+func NewRateLimiter(capacity int, resetInterval time.Duration) *RateLimiter {
+	rl := &RateLimiter{
+		buckets:       make(map[string]*TokenBucket),
+		cleanup:       make(chan struct{}),
+		capacity:      capacity,
+		resetInterval: resetInterval,
+	}
+
+	// Start cleanup goroutine to remove old buckets
+	go rl.cleanupRoutine()
+
+	return rl
+}
+
+// Allow checks if a request from the given client should be allowed
+func (rl *RateLimiter) Allow(clientIP string) bool {
+	rl.mu.Lock()
+	bucket, exists := rl.buckets[clientIP]
+	if !exists {
+		bucket = NewTokenBucket(rl.capacity, rl.resetInterval)
+		rl.buckets[clientIP] = bucket
+	}
+	rl.mu.Unlock()
+
+	return bucket.Allow()
+}
+
+// cleanupRoutine periodically removes unused buckets to prevent memory leaks
+func (rl *RateLimiter) cleanupRoutine() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			rl.mu.Lock()
+			now := time.Now()
+			for ip, bucket := range rl.buckets {
+				// Remove buckets that haven't been used for 10 minutes
+				if now.Sub(bucket.lastReset) > 10*time.Minute {
+					delete(rl.buckets, ip)
+				}
+			}
+			rl.mu.Unlock()
+		case <-rl.cleanup:
+			return
+		}
+	}
+}
+
+// Stop stops the cleanup routine
+func (rl *RateLimiter) Stop() {
+	close(rl.cleanup)
+}
+
+// getClientIP extracts the client IP address from the request
+func getClientIP(r *http.Request) string {
+	// Check X-Forwarded-For header first (for proxied requests)
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// X-Forwarded-For can contain multiple IPs, take the first one
+		if idx := strings.Index(xff, ","); idx != -1 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+
+	// Check X-Real-IP header
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+
+	// Fall back to RemoteAddr
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr // Return as-is if parsing fails
+	}
+	return ip
 }
 
 type LoadBalancer struct {
@@ -264,6 +401,17 @@ func main() {
 		operational: true, // Assume operational initially
 	}
 
+	// Create rate limiter using configuration with sensible defaults
+	tokenCapacity := config.RateLimitTokenCapacity
+	if tokenCapacity <= 0 {
+		tokenCapacity = DefaultTokenBucketCapacity
+	}
+	resetInterval := config.RateLimitResetInterval
+	if resetInterval <= 0 {
+		resetInterval = DefaultTokenResetInterval
+	}
+	rateLimiter := NewRateLimiter(tokenCapacity, resetInterval)
+
 	// Initialize statuses
 	for i, server := range targetURLs {
 		loadBalancer.statuses[i] = ServerStatus{
@@ -276,11 +424,23 @@ func main() {
 	log.Printf("Running initial health check...")
 	loadBalancer.performHealthChecks()
 
-	// Start periodic health checks
-	loadBalancer.StartHealthChecks(HealthCheckInterval)
+	// Start periodic health checks (configurable)
+	hcInterval := config.HealthCheckInterval
+	if hcInterval <= 0 {
+		hcInterval = HealthCheckInterval
+	}
+	loadBalancer.StartHealthChecks(hcInterval)
 
 	// Add health check endpoint
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		// Rate limiting check
+		clientIP := getClientIP(r)
+		if !rateLimiter.Allow(clientIP) {
+			log.Printf("Rate limit exceeded for client %s on healthz endpoint", clientIP)
+			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		serverStatuses := loadBalancer.GetServerStatuses()
 		json.NewEncoder(w).Encode(serverStatuses)
@@ -288,6 +448,14 @@ func main() {
 
 	// Add load-balanced /hello endpoint
 	http.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
+		// Rate limiting check
+		clientIP := getClientIP(r)
+		if !rateLimiter.Allow(clientIP) {
+			log.Printf("Rate limit exceeded for client %s", clientIP)
+			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+
 		// Check if load balancer is operational
 		if !loadBalancer.IsOperational() {
 			log.Printf("Load balancer not operational - all servers down for request to %s", r.URL.Path)
@@ -348,7 +516,12 @@ func main() {
 
 	log.Printf("listening on %s, forwarding based on config", listenAddr)
 	log.Printf("Health checks available at /healthz")
-	log.Printf("Starting health checks every %v", HealthCheckInterval)
+	log.Printf("Starting health checks every %v", hcInterval)
+	log.Printf("Rate limiting enabled: Token bucket with capacity %d tokens, resets to full capacity every %v", tokenCapacity, resetInterval)
+
+	// Ensure rate limiter cleanup routine is stopped on exit
+	defer rateLimiter.Stop()
+
 	if err := http.ListenAndServe(listenAddr, nil); err != nil {
 		log.Fatal(err)
 	}
