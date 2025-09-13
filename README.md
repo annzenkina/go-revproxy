@@ -6,7 +6,7 @@ A health-aware round-robin load balancer written in Go that intelligently distri
 
 - **Health-aware load balancing**: Automatically skips unhealthy servers and distributes requests only to healthy ones
 - **Round-robin distribution**: Evenly distributes requests across available healthy servers
-- **Automatic health checks**: Continuously monitors backend server health every 5 seconds
+- **Automatic health checks**: Configurable interval (default 5 seconds)
 - **Request-level retry logic**: Automatically retries failed requests on different healthy servers (up to 3 attempts)
 - **Real-time failure detection**: Immediately re-checks server health when requests fail, doesn't wait for next health check cycle
 - **YAML configuration**: Flexible configuration management via `config.yaml`
@@ -14,6 +14,7 @@ A health-aware round-robin load balancer written in Go that intelligently distri
 - **Graceful failure handling**: Returns appropriate HTTP errors when all servers are down or all retries fail
 - **Request logging**: Comprehensive logging of requests, health checks, retries, and server status changes
 - **Concurrent health checking**: Non-blocking parallel health checks for optimal performance
+- **Rate limiting**: Token bucket per client IP; configurable capacity and reset interval
 
 ## Usage
 
@@ -90,11 +91,19 @@ routes:
     target: "http://localhost:9002"
   - prefix: "/server3"
     target: "http://localhost:9003"
+healthCheckInterval: 5s
+rateLimitTokenCapacity: 5
+rateLimitResetInterval: 1m
 ```
+
+Config keys:
+- `healthCheckInterval`: How often to run backend health checks (e.g., `3s`, `10s`). Default: `5s`.
+- `rateLimitTokenCapacity`: Max tokens per client bucket. Default: `5`.
+- `rateLimitResetInterval`: How often buckets reset to full capacity (e.g., `30s`, `1m`). Default: `1m`.
 
 ## How It Works
 
-1. **Health Monitoring**: Every 5 seconds, the load balancer checks all backend servers concurrently
+1. **Health Monitoring**: At a configurable interval (default 5s), the load balancer checks all backend servers concurrently
 2. **Request Handling**: Incoming requests to `/hello` trigger the health-aware load balancer
 3. **Healthy Server Selection**: Only healthy servers are considered for load balancing
 4. **Round-robin Distribution**: Requests are distributed evenly among healthy servers using an atomic counter
@@ -134,6 +143,7 @@ Example health check response:
 2024/01/01 12:00:00 listening on :8080, forwarding based on config
 2024/01/01 12:00:00 Health checks available at /healthz
 2024/01/01 12:00:00 Starting health checks every 5s
+2024/01/01 12:00:00 Rate limiting enabled: Token bucket with capacity 5 tokens, resets to full capacity every 1m0s
 2024/01/01 12:00:00 Running initial health check...
 2024/01/01 12:00:05 Request: forwarding /hello to http://localhost:9001 (attempt 1)
 2024/01/01 12:00:06 Request: forwarding /hello to http://localhost:9002 (attempt 1)
@@ -163,10 +173,10 @@ To modify the application:
 - ✅ **Health status endpoint** - `/healthz` API for monitoring server status
 - ✅ **Configuration management** - YAML-based configuration system
 - ✅ **Enhanced logging** - Comprehensive request and health check logging
+- ✅ **Request-level retry logic** - Retries failed requests on other healthy servers
+- ✅ **Rate limiting** - Token bucket per client IP
 
 ### Planned Features 🚧
-- Add retry logic to handle server failures during request forwarding
-- **Rate limiting** - Request throttling and protection
 - **Header modification** - Adding custom response headers, removing/modifying request headers  
 - **Advanced metrics** - Prometheus metrics, request timing, throughput statistics
 - **Multiple routing strategies** - Weighted round-robin, least connections, IP hash
