@@ -10,3 +10,9 @@ routes:
 rateLimitTokenCapacity: 5           # max tokens per client bucket
 rateLimitResetInterval: 1m          # interval to reset to full capacity (e.g. 30s, 1m, 2m30s)
 healthCheckInterval: 5s             # interval between health checks
+
+# Health check failure handling configuration
+healthCheckFailureCodes: [502, 503, 504]  # HTTP status codes that indicate server failure (default: [502])
+healthCheckMaxRetries: 3                   # max retries before removing server from rotation (default: 3)
+healthCheckRetryDelay: 1s                  # initial delay between retries with exponential backoff (default: 1s)
+healthCheckTimeout: 5s                     # timeout for individual health check requests (default: 5s)

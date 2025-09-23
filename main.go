@@ -21,6 +21,12 @@ const (
 	HealthCheckInterval        = 5 * time.Second
 	DefaultTokenBucketCapacity = 5
 	DefaultTokenResetInterval  = 1 * time.Minute
+	// Default health check configuration
+	DefaultHealthCheckMaxRetries = 1
+	DefaultHealthCheckRetryDelay = 1 * time.Second
+	DefaultHealthCheckTimeout    = 5 * time.Second
+	// Exponential backoff multiplier
+	ExponentialBackoffMultiplier = 1.5
 )
 
 type Config struct {
@@ -32,12 +38,118 @@ type Config struct {
 	RateLimitTokenCapacity int           `yaml:"rateLimitTokenCapacity"`
 	RateLimitResetInterval time.Duration `yaml:"rateLimitResetInterval"`
 	HealthCheckInterval    time.Duration `yaml:"healthCheckInterval"`
+	// Health check failure configuration
+	HealthCheckFailureCodes []int         `yaml:"healthCheckFailureCodes"` // HTTP status codes that indicate failure
+	HealthCheckMaxRetries   int           `yaml:"healthCheckMaxRetries"`   // Max retries before removing server from rotation
+	HealthCheckRetryDelay   time.Duration `yaml:"healthCheckRetryDelay"`   // Initial delay between retries (exponential backoff)
+	HealthCheckTimeout      time.Duration `yaml:"healthCheckTimeout"`      // Timeout for individual health check requests
 }
 
 type ServerStatus struct {
 	URL     string `json:"url"`
 	Healthy bool   `json:"healthy"`
 	Error   string `json:"error,omitempty"`
+}
+
+// ServerState tracks detailed state information for each server
+type ServerState struct {
+	URL           string
+	Healthy       bool
+	InRotation    bool          // Whether server is currently in rotation
+	RetryCount    int           // Current retry attempt count
+	LastHealthy   time.Time     // Last time server was healthy
+	LastFailed    time.Time     // Last time server failed
+	NextRetryTime time.Time     // When to attempt next retry
+	RetryDelay    time.Duration // Current retry delay (for exponential backoff)
+	LastError     string
+	mu            sync.RWMutex // Mutex for thread-safe access
+}
+
+// NewServerState creates a new ServerState with default values
+func NewServerState(url string, initialDelay time.Duration) *ServerState {
+	return &ServerState{
+		URL:         url,
+		Healthy:     true,
+		InRotation:  true,
+		RetryCount:  0,
+		LastHealthy: time.Now(),
+		RetryDelay:  initialDelay,
+	}
+}
+
+// calculateExponentialBackoff calculates the next retry delay and time
+func (ss *ServerState) calculateExponentialBackoff(multiplier float64) {
+	nextDelay := time.Duration(float64(ss.RetryDelay) * multiplier)
+	ss.NextRetryTime = time.Now().Add(ss.RetryDelay) // Use current delay for this retry
+	ss.RetryDelay = nextDelay
+}
+
+// MarkHealthy marks the server as healthy and resets retry state
+func (ss *ServerState) MarkHealthy(initialDelay time.Duration) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+
+	wasUnhealthy := !ss.Healthy
+	ss.Healthy = true
+	ss.InRotation = true
+	ss.RetryCount = 0
+	ss.RetryDelay = initialDelay
+	ss.LastHealthy = time.Now()
+	ss.LastError = ""
+
+	if wasUnhealthy {
+		log.Printf("Server %s recovered and is now healthy", ss.URL)
+	}
+}
+
+// MarkUnhealthy marks the server as unhealthy and updates retry state
+func (ss *ServerState) MarkUnhealthy(errorMsg string, maxRetries int) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+
+	ss.Healthy = false
+	ss.LastFailed = time.Now()
+	ss.LastError = errorMsg
+	ss.RetryCount++
+
+	// Calculate next retry time with exponential backoff
+	ss.calculateExponentialBackoff(ExponentialBackoffMultiplier)
+
+	// Remove from rotation if max retries exceeded
+	if ss.RetryCount >= maxRetries {
+		ss.InRotation = false
+		log.Printf("Server %s removed from rotation after %d failed attempts", ss.URL, ss.RetryCount)
+	} else {
+		log.Printf("Server %s marked unhealthy (attempt %d/%d), next retry at %v: %s",
+			ss.URL, ss.RetryCount, maxRetries, ss.NextRetryTime.Format(time.RFC3339), errorMsg)
+	}
+}
+
+// ShouldRetry checks if it's time to retry this server
+func (ss *ServerState) ShouldRetry(maxRetries int) bool {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+
+	return !ss.Healthy && ss.RetryCount < maxRetries && time.Now().After(ss.NextRetryTime)
+}
+
+// IsInRotation checks if the server is currently in rotation
+func (ss *ServerState) IsInRotation() bool {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	return ss.InRotation
+}
+
+// GetStatus returns a ServerStatus for API compatibility
+func (ss *ServerState) GetStatus() ServerStatus {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+
+	return ServerStatus{
+		URL:     ss.URL,
+		Healthy: ss.Healthy,
+		Error:   ss.LastError,
+	}
 }
 
 // TokenBucket represents a token bucket for rate limiting
@@ -172,11 +284,13 @@ func getClientIP(r *http.Request) string {
 
 type LoadBalancer struct {
 	servers       []*url.URL
-	statuses      []ServerStatus
+	statuses      []ServerStatus // For backward compatibility with health endpoint
+	serverStates  []*ServerState // Enhanced state tracking
 	counter       int32
 	mu            sync.RWMutex
 	operational   bool
 	operationalMu sync.RWMutex
+	config        *Config // Reference to configuration
 }
 
 func (lb *LoadBalancer) StartHealthChecks(interval time.Duration) {
@@ -195,9 +309,41 @@ func (lb *LoadBalancer) performHealthChecks() {
 	for i, server := range lb.servers {
 		go func(index int, serverURL *url.URL) {
 			defer wg.Done()
-			status := checkServerHealth(serverURL.String())
+
+			serverState := lb.serverStates[index]
+
+			// Get config values
+			timeout := DefaultHealthCheckTimeout
+			maxRetries := DefaultHealthCheckMaxRetries
+			initialDelay := DefaultHealthCheckRetryDelay
+			var failureCodes []int
+			if lb.config != nil {
+				if lb.config.HealthCheckTimeout > 0 {
+					timeout = lb.config.HealthCheckTimeout
+				}
+				if lb.config.HealthCheckMaxRetries > 0 {
+					maxRetries = lb.config.HealthCheckMaxRetries
+				}
+				if lb.config.HealthCheckRetryDelay > 0 {
+					initialDelay = lb.config.HealthCheckRetryDelay
+				}
+				failureCodes = lb.config.HealthCheckFailureCodes
+			}
+
+			// Check if this server should be retried (for failed servers)
+			if !serverState.IsInRotation() || serverState.ShouldRetry(maxRetries) {
+				status := checkServerHealthWithConfig(serverURL.String(), failureCodes, timeout)
+
+				if status.Healthy {
+					serverState.MarkHealthy(initialDelay)
+				} else {
+					serverState.MarkUnhealthy(status.Error, maxRetries)
+				}
+			}
+
+			// Update backward-compatible status
 			lb.mu.Lock()
-			lb.statuses[index] = status
+			lb.statuses[index] = serverState.GetStatus()
 			lb.mu.Unlock()
 		}(i, server)
 	}
@@ -234,10 +380,10 @@ func (lb *LoadBalancer) GetNextHealthyServer() *url.URL {
 	lb.mu.RLock()
 	defer lb.mu.RUnlock()
 
-	// Get healthy servers
+	// Get servers that are healthy and in rotation
 	var healthyServers []*url.URL
-	for i, status := range lb.statuses {
-		if status.Healthy {
+	for i, serverState := range lb.serverStates {
+		if serverState.IsInRotation() && serverState.Healthy {
 			healthyServers = append(healthyServers, lb.servers[i])
 		}
 	}
@@ -267,23 +413,63 @@ func (lb *LoadBalancer) IsOperational() bool {
 	return lb.operational
 }
 
+// MarkServerFailed marks a server as failed during request processing
+func (lb *LoadBalancer) MarkServerFailed(serverURL string, errorMsg string) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	// Get max retries from config
+	maxRetries := DefaultHealthCheckMaxRetries
+	if lb.config != nil && lb.config.HealthCheckMaxRetries > 0 {
+		maxRetries = lb.config.HealthCheckMaxRetries
+	}
+
+	// Find and update the server state
+	for i, server := range lb.servers {
+		if server.String() == serverURL {
+			lb.serverStates[i].MarkUnhealthy(errorMsg, maxRetries)
+			lb.statuses[i] = lb.serverStates[i].GetStatus()
+			break
+		}
+	}
+
+	// Update operational status
+	go lb.updateOperationalStatus()
+}
+
 // TriggerImmediateHealthCheck performs an immediate health check on a specific server
 func (lb *LoadBalancer) TriggerImmediateHealthCheck(serverURL string) {
 	go func() {
-		status := checkServerHealthWithRetry(serverURL)
+		// Get config values
+		timeout := DefaultHealthCheckTimeout
+		maxRetries := DefaultHealthCheckMaxRetries
+		initialDelay := DefaultHealthCheckRetryDelay
+		var failureCodes []int
+		if lb.config != nil {
+			if lb.config.HealthCheckTimeout > 0 {
+				timeout = lb.config.HealthCheckTimeout
+			}
+			if lb.config.HealthCheckMaxRetries > 0 {
+				maxRetries = lb.config.HealthCheckMaxRetries
+			}
+			if lb.config.HealthCheckRetryDelay > 0 {
+				initialDelay = lb.config.HealthCheckRetryDelay
+			}
+			failureCodes = lb.config.HealthCheckFailureCodes
+		}
+
+		status := checkServerHealthWithConfig(serverURL, failureCodes, timeout)
+
 		lb.mu.Lock()
 		// Find and update the status of this specific server
 		for i, server := range lb.servers {
 			if server.String() == serverURL {
-				oldStatus := lb.statuses[i].Healthy
-				lb.statuses[i] = status
-				if oldStatus != status.Healthy {
-					if status.Healthy {
-						log.Printf("Server %s recovered and is now healthy", serverURL)
-					} else {
-						log.Printf("Server %s marked as unhealthy: %s", serverURL, status.Error)
-					}
+				if status.Healthy {
+					lb.serverStates[i].MarkHealthy(initialDelay)
+				} else {
+					lb.serverStates[i].MarkUnhealthy(status.Error, maxRetries)
 				}
+				lb.statuses[i] = lb.serverStates[i].GetStatus()
 				break
 			}
 		}
@@ -292,9 +478,13 @@ func (lb *LoadBalancer) TriggerImmediateHealthCheck(serverURL string) {
 	}()
 }
 
-func checkServerHealth(serverURL string) ServerStatus {
-	resp, err := http.Get(serverURL + "/")
+func checkServerHealthWithConfig(serverURL string, failureCodes []int, timeout time.Duration) ServerStatus {
+	// Create HTTP client with timeout
+	client := &http.Client{
+		Timeout: timeout,
+	}
 
+	resp, err := client.Get(serverURL + "/")
 	if err != nil {
 		return ServerStatus{
 			URL:     serverURL,
@@ -304,7 +494,8 @@ func checkServerHealth(serverURL string) ServerStatus {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	// Check if status code indicates failure
+	if isFailureStatusCode(resp.StatusCode, failureCodes) {
 		return ServerStatus{
 			URL:     serverURL,
 			Healthy: false,
@@ -315,9 +506,9 @@ func checkServerHealth(serverURL string) ServerStatus {
 	// Try to parse the server's response as JSON
 	var serverResponse ServerStatus
 	if err := json.NewDecoder(resp.Body).Decode(&serverResponse); err != nil {
-		// Standard approach: any HTTP 200 response is considered healthy
+		// Standard approach: any HTTP 200-299 response is considered healthy
 		// This is how most load balancers and health check systems work
-		log.Printf("Info: Server %s responded with HTTP 200 (non-JSON), treating as healthy", serverURL)
+		log.Printf("Info: Server %s responded with HTTP %d (non-JSON), treating as healthy", serverURL, resp.StatusCode)
 		return ServerStatus{
 			URL:     serverURL,
 			Healthy: true,
@@ -330,33 +521,22 @@ func checkServerHealth(serverURL string) ServerStatus {
 	return serverResponse
 }
 
-// checkServerHealthWithRetry performs health check with retry logic
-func checkServerHealthWithRetry(serverURL string) ServerStatus {
-	maxRetries := 3
-	var lastStatus ServerStatus
+// isFailureStatusCode checks if a status code indicates failure
+func isFailureStatusCode(statusCode int, failureCodes []int) bool {
+	// If no failure codes are configured, use default behavior
+	if len(failureCodes) == 0 {
+		// Default: anything outside 200-299 range is considered failure
+		return statusCode < 200 || statusCode >= 300
+	}
 
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		log.Printf("Health check attempt %d/%d for %s", attempt, maxRetries, serverURL)
-		status := checkServerHealth(serverURL)
-
-		if status.Healthy {
-			if attempt > 1 {
-				log.Printf("Server %s recovered after %d attempts", serverURL, attempt)
-			}
-			return status
-		}
-
-		lastStatus = status
-		log.Printf("Health check failed for %s (attempt %d/%d): %s", serverURL, attempt, maxRetries, status.Error)
-
-		// Don't wait after the last attempt
-		if attempt < maxRetries {
-			time.Sleep(time.Duration(attempt) * time.Second) // Progressive backoff: 1s, 2s, 3s
+	// Check against configured failure codes
+	for _, code := range failureCodes {
+		if code == statusCode {
+			return true
 		}
 	}
 
-	log.Printf("Server %s failed all %d health check attempts, marking as unhealthy", serverURL, maxRetries)
-	return lastStatus
+	return false
 }
 
 // loadConfig reads and parses the YAML configuration file
@@ -394,11 +574,36 @@ func main() {
 		targetURLs[i] = targetURL
 	}
 
+	// Set default health check configuration if not provided
+	if len(config.HealthCheckFailureCodes) == 0 {
+		config.HealthCheckFailureCodes = []int{502} // Default failure code as requested
+	}
+	if config.HealthCheckMaxRetries <= 0 {
+		config.HealthCheckMaxRetries = DefaultHealthCheckMaxRetries
+	}
+	if config.HealthCheckRetryDelay <= 0 {
+		config.HealthCheckRetryDelay = DefaultHealthCheckRetryDelay
+	}
+	if config.HealthCheckTimeout <= 0 {
+		config.HealthCheckTimeout = DefaultHealthCheckTimeout
+	}
+
+	// Create server states
+	serverStates := make([]*ServerState, len(targetURLs))
+	for i, server := range targetURLs {
+		serverStates[i] = NewServerState(
+			server.String(),
+			config.HealthCheckRetryDelay,
+		)
+	}
+
 	// Create load balancer
 	loadBalancer := &LoadBalancer{
-		servers:     targetURLs,
-		statuses:    make([]ServerStatus, len(targetURLs)),
-		operational: true, // Assume operational initially
+		servers:      targetURLs,
+		statuses:     make([]ServerStatus, len(targetURLs)),
+		serverStates: serverStates,
+		operational:  true, // Assume operational initially
+		config:       config,
 	}
 
 	// Create rate limiter using configuration with sensible defaults
@@ -412,12 +617,9 @@ func main() {
 	}
 	rateLimiter := NewRateLimiter(tokenCapacity, resetInterval)
 
-	// Initialize statuses
-	for i, server := range targetURLs {
-		loadBalancer.statuses[i] = ServerStatus{
-			URL:     server.String(),
-			Healthy: true, // Assume healthy initially
-		}
+	// Initialize statuses from server states
+	for i, serverState := range serverStates {
+		loadBalancer.statuses[i] = serverState.GetStatus()
 	}
 
 	// Run initial health check immediately
@@ -483,9 +685,8 @@ func main() {
 				log.Printf("Request failed to %s: %v", nextURL.String(), err)
 				requestFailed = true
 
-				// Trigger immediate health check for the failed server
-				log.Printf("Triggering immediate health check for failed server: %s", nextURL.String())
-				loadBalancer.TriggerImmediateHealthCheck(nextURL.String())
+				// Mark server as failed for immediate removal from rotation
+				loadBalancer.MarkServerFailed(nextURL.String(), err.Error())
 
 				// Only send error response on the last attempt
 				if attempt == maxRetries-1 {
@@ -518,6 +719,8 @@ func main() {
 	log.Printf("Health checks available at /healthz")
 	log.Printf("Starting health checks every %v", hcInterval)
 	log.Printf("Rate limiting enabled: Token bucket with capacity %d tokens, resets to full capacity every %v", tokenCapacity, resetInterval)
+	log.Printf("Health check configuration: failure codes %v, max retries %d, retry delay %v, timeout %v",
+		config.HealthCheckFailureCodes, config.HealthCheckMaxRetries, config.HealthCheckRetryDelay, config.HealthCheckTimeout)
 
 	// Ensure rate limiter cleanup routine is stopped on exit
 	defer rateLimiter.Stop()
